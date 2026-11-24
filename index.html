@@ -1078,20 +1078,22 @@ function yin(buf, sr) {
   if (tau > 1 && tau < maxTau) { const s0 = c[tau - 1], s1 = c[tau], s2 = c[tau + 1], den = s0 - 2 * s1 + s2; if (den) better = tau + (s0 - s2) / (2 * den); }
   return { freq: sr / better, conf: 1 - c[tau] };
 }
-const recent = [];
+const recent = []; let missRun = 0;
 function detect() {
   if (SIM) { const f = window.__simFreq, nz = !!window.__simNoisy; return f ? { freq: f, rms: window.__simRms ?? 0.1, clarity: window.__simClarity ?? 0.9, conf: nz ? 0.82 : 0.97, noisy: nz } : { freq: null, rms: 0, clarity: 0, conf: 0 }; }
   if (!analyser) return { freq: null, rms: 0, clarity: 0 };
   analyser.getFloatTimeDomainData(timeBuf);
   const buf = timeBuf.subarray(timeBuf.length - 2048);
   let rms = 0; for (let i = 0; i < buf.length; i++) rms += buf[i] * buf[i]; rms = Math.sqrt(rms / buf.length);
-  if (rms < 0.004) { recent.length = 0; return { freq: null, rms, clarity: 0 }; }
+  // 잠깐 끊겨도(활 바꿀 때 등) 바로 잊지 않도록, 4번 연속 놓쳤을 때만 최근 값을 지워요
+  if (rms < 0.0025) { if (++missRun > 3) recent.length = 0; return { freq: null, rms, clarity: 0 }; }
   const r = yin(buf, actx.sampleRate);
-  if (!r || r.conf < 0.8) { recent.length = 0; return { freq: null, rms, clarity: 0, conf: r ? r.conf : 0, noisy: rms > 0.008 }; }
+  if (!r || r.conf < 0.72) { if (++missRun > 3) recent.length = 0; return { freq: null, rms, clarity: 0, conf: r ? r.conf : 0, noisy: rms > 0.008 }; }
+  missRun = 0;
   recent.push(r.freq); if (recent.length > 5) recent.shift();
   // 선명도: YIN 신뢰도 + 소리 크기
-  const clarity = clamp((r.conf - 0.8) / 0.19, 0, 1) * 0.6 + clamp(rms / 0.08, 0, 1) * 0.4;
-  return { freq: median(recent), rms, clarity, conf: r.conf, noisy: r.conf < 0.86 };
+  const clarity = clamp((r.conf - 0.72) / 0.27, 0, 1) * 0.6 + clamp(rms / 0.08, 0, 1) * 0.4;
+  return { freq: median(recent), rms, clarity, conf: r.conf, noisy: r.conf < 0.82 };
 }
 /* 목표 음과 비교. 한 옥타브 위아래로 잡혀도 음정은 판정하고, 옥타브 유지율에만 반영해요 */
 function compare(det, target) {
@@ -1212,7 +1214,7 @@ function openSong(id) {
 
 /* ========================= 연주 진행 ========================= */
 let running = false, idx = 0, P = 0, startedAt = 0;
-let hold = 0, holdCents = [], holdOct = [0, 0], needRelease = false, prevMidi = null, peakRms = 0;
+let hold = 0, holdCents = [], holdOct = [0, 0], needRelease = false, prevMidi = null, peakRms = 0, relT = 0, relPeak = 0, ahead = { k: 0, t: 0, cents: [], oct: [0, 0] };
 let mStart = 0, mStartBeat = 0, mEv = -1, mSamples = [], mOct = [0, 0], counting = false;
 let lastLive = null, lastDet = { freq: null, clarity: 0, rms: 0 };
 const COUNT_IN = 4;
@@ -1303,7 +1305,7 @@ function beginRun() {
   if (idx >= notes.length) resetRun();
   running = true; startedAt = performance.now(); keepAwake(true);
   const sb = document.getElementById('startBtn'); sb.textContent = '멈춤'; sb.className = 'btn stop';
-  hold = 0; holdCents = []; holdOct = [0, 0]; needRelease = false; bowRecent = [];
+  hold = 0; holdCents = []; holdOct = [0, 0]; needRelease = false; bowRecent = []; ahead = { k: 0, t: 0, cents: [], oct: [0, 0] };
   for (let i = idx; i < notes.length; i++) { const n = notes[i]; n.result = null; n.octOk = 0; n.octAll = 0; n.dev = null; n.rhythm = null; n.susOn = 0; n.susTot = 0; n.bow = null; n.bowF = [0, 0, 0]; n.rmsList = []; paintNote(i); paintRhythm(i); }
   highlight(idx); showTargetInfo(idx);
   if (settings.prog === 'metro') {
@@ -1360,19 +1362,47 @@ function followFrame(det, live, dt) {
   const n = notes[idx]; if (!n) return;
   P += (n.start - P) * Math.min(1, dt * 7);
   if (needRelease) {
-    if (!det.freq || Math.abs(hzToMidi(det.freq) - prevMidi) > 0.7 || det.rms < peakRms * 0.55) needRelease = false;
-    else { peakRms = Math.max(peakRms, det.rms); return; }
+    // 같은 음이 두 번 이어질 때: 활을 바꾸며 소리가 살짝 작아지거나, 음이 끊기거나, 0.9초가 지나면 다음 음으로 받아요
+    relT += dt; relPeak = Math.max(det.rms, relPeak * Math.exp(-dt / 0.25));
+    const changed = !det.freq || Math.abs(hzToMidi(det.freq) - prevMidi) > 0.7;
+    if (changed || det.rms < relPeak * 0.7 || relT > 0.9) { needRelease = false; setStatus(progressText()); }
+    else if (catchUp(det, dt)) return;
+    else { if (relT > 0.45) setStatus('같은 음이 한 번 더 나와요 · 활을 바꾸면 다음 음으로 넘어가요'); return; }
   }
   bowFrame(n, det);
+  if (catchUp(det, dt)) return;
   if (live && live.matched) {
     hold += dt; holdCents.push(live.cents); holdOct[1]++; if (live.octOk) holdOct[0]++;
     if (hold >= D().hold) {
       finishNote(idx, median(holdCents), holdOct);
-      prevMidi = n.midi; peakRms = det.rms; hold = 0; holdCents = []; holdOct = [0, 0];
+      prevMidi = n.midi; peakRms = det.rms; relPeak = det.rms; relT = 0; hold = 0; holdCents = []; holdOct = [0, 0];
       const nextSame = notes[idx + 1] && notes[idx + 1].midi === prevMidi;
       advance(); needRelease = !!nextSame;
     }
   } else { hold = Math.max(0, hold - dt); if (hold === 0) { holdCents = []; holdOct = [0, 0]; } }
+}
+/* 따라잡기: 앱이 한 음 뒤처졌는데(예: 같은 음 두 번을 하나로 들음) 연주자는 이미 다음 음을 내고 있으면,
+   그 음을 충분히 들은 뒤 건너뛴 음을 처리하고 따라가요. 같은 음이 반복된 것은 바로 앞 음의 판정을 그대로 줘요. */
+function catchUp(det, dt) {
+  const cur = notes[idx];
+  if (!det.freq || (compare(det, cur.midi) || {}).matched) { ahead.k = 0; ahead.t = 0; ahead.cents = []; ahead.oct = [0, 0]; return false; }
+  let k = 0, lv = null;
+  for (let j = 1; j <= 2 && idx + j < notes.length; j++) { const c = compare(det, notes[idx + j].midi); if (c && c.matched) { k = j; lv = c; break; } }
+  if (!k) { ahead.k = 0; ahead.t = 0; ahead.cents = []; ahead.oct = [0, 0]; return false; }
+  if (k !== ahead.k) { ahead = { k, t: 0, cents: [], oct: [0, 0] }; }
+  ahead.t += dt; ahead.cents.push(lv.cents); ahead.oct[1]++; if (lv.octOk) ahead.oct[0]++;
+  if (ahead.t < D().hold + 0.12) return false;
+  for (let j = 0; j < k; j++) {
+    const i = idx, prev = notes[i - 1];
+    if (prev && prev.midi === notes[i].midi && prev.cents != null) finishNote(i, prev.cents, [1, 1]);
+    else finishNote(i, null, [0, 0]);
+    idx++;
+  }
+  needRelease = false; relT = 0;
+  hold = ahead.t; holdCents = ahead.cents.slice(); holdOct = ahead.oct.slice();
+  ahead = { k: 0, t: 0, cents: [], oct: [0, 0] };
+  highlight(idx); showTargetInfo(idx); setStatus(progressText());
+  return true;
 }
 function beatsPerBar() { const [a, b] = (song.meter || '4/4').split('/').map(Number); return (a && b) ? a * 4 / b : 4; }
 function metroFrame(live, det) {
